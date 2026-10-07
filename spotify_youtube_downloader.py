@@ -1,22 +1,16 @@
-"""
-Spotify → YouTube Downloader (V2 Final)
----------------------------------------
-✔ No Spotify API
-✔ Track scrape (fast)
-✔ Playlist via Selenium (auto driver)
-✔ Ask user where to save files
-✔ Parallel downloads
-✔ MP3 / MP4
-
-Install:
-    pip install pytubefix moviepy requests beautifulsoup4 selenium
-"""
-
-import os, re, shutil, json, requests, time
+import os, re, json, requests, time
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from pytubefix import YouTube, Search
-from moviepy import VideoFileClip, AudioFileClip
+from pytubefix.cli import on_progress
+from pytubefix.exceptions import VideoUnavailable
+from moviepy import AudioFileClip
+
+try:
+    from pytubefix.exceptions import SABRError
+    SABR_EXCEPTIONS = (SABRError,)
+except ImportError:
+    SABR_EXCEPTIONS = ()  # older pytubefix versions don't have this exception yet
 
 # Selenium
 from selenium import webdriver
@@ -117,11 +111,37 @@ def find_youtube(title, artist):
 
 
 # ══════════════════════════════════════════════
-# ⬇ DOWNLOAD
+# ⬇ DOWNLOAD  (updated for current pytubefix API)
 # ══════════════════════════════════════════════
 
 def sanitize(name):
     return re.sub(r'[\\/:*?"<>|]', '', name)
+
+
+def get_progressive_stream(yt_url):
+    """
+    Try a handful of pytubefix client identities until one returns a
+    progressive (non-SABR) stream. Different clients get different sets of
+    available formats per video from YouTube, so a single client (e.g. WEB)
+    frequently comes back empty even when another client works fine.
+    Returns (yt, stream) or (None, None) if nothing worked.
+    """
+    candidate_clients = ["WEB", "MWEB", "ANDROID", "IOS", "TV_EMBED", "ANDROID_VR"]
+
+    for client in candidate_clients:
+        try:
+            yt = YouTube(
+                yt_url,
+                client=client,
+                on_progress_callback=on_progress,
+            )
+            stream = yt.streams.get_highest_resolution()
+            if stream:
+                return yt, stream
+        except Exception:
+            continue
+
+    return None, None
 
 
 def download(track, fmt):
@@ -137,18 +157,47 @@ def download(track, fmt):
         return
 
     try:
-        yt = YouTube(yt_url)
+        # Progressive streams (audio+video combined in one file, e.g. itag
+        # 18/22) are served over plain HTTPS and do NOT require SABR/PoToken.
+        # Only the separate high-res video-only and audio-only DASH streams
+        # do — which is what was triggering the "SABR Maximum reload
+        # attempts reached" errors. Try several client identities since
+        # availability of the progressive stream varies per video/client.
+        yt, stream = get_progressive_stream(yt_url)
+        if not stream:
+            print("❌ No progressive (non-SABR) stream available for this video on any client")
+            return
 
         if fmt == "MP3":
-            stream = yt.streams.filter(only_audio=True).first()
-            temp = stream.download(DOWNLOAD_PATH, filename=label + "_tmp")
-            shutil.move(temp, os.path.join(DOWNLOAD_PATH, label + ".mp3"))
+            temp_video = stream.download(
+                output_path=DOWNLOAD_PATH,
+                filename=label + "_tmp.mp4",
+                skip_existing=False,
+            )
+            mp3_path = os.path.join(DOWNLOAD_PATH, label + ".mp3")
+            clip = AudioFileClip(temp_video)
+            clip.write_audiofile(mp3_path, logger=None)
+            clip.close()
+            os.remove(temp_video)
 
         else:
-            stream = yt.streams.get_highest_resolution()
-            stream.download(DOWNLOAD_PATH, filename=label + ".mp4")
+            stream.download(
+                output_path=DOWNLOAD_PATH,
+                filename=label + ".mp4",
+                skip_existing=False,
+            )
 
         print("✅ Downloaded")
+
+    except SABR_EXCEPTIONS as e:
+        # YouTube's SABR stream-protection layer is currently a known,
+        # unresolved pain point for pytubefix (ongoing as of mid-2026) —
+        # it can lock out a video mid-download even after a valid PoToken.
+        # Skip and move on rather than killing the whole batch.
+        print(f"❌ SABR protection blocked this stream, skipping: {e}")
+
+    except VideoUnavailable as e:
+        print(f"❌ Video unavailable, skipping: {e}")
 
     except Exception as e:
         print("❌ Error:", e)
@@ -177,7 +226,12 @@ def process(url, fmt):
 
     print(f"✅ Found {len(tracks)} tracks")
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # NOTE: max_workers is set to 1, not 3. Running downloads in parallel
+    # means multiple simultaneous PoToken/session requests hit YouTube at
+    # once, which looks bot-like and appears to trigger the SABR lockout
+    # faster (see the download() function for details). Sequential is
+    # slower but noticeably more reliable right now.
+    with ThreadPoolExecutor(max_workers=1) as executor:
         for t in tracks:
             executor.submit(download, t, fmt)
 
